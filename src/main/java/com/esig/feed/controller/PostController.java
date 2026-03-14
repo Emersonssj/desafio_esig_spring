@@ -2,122 +2,125 @@ package com.esig.feed.controller;
 
 import com.esig.feed.model.Post;
 import com.esig.feed.repository.PostRepository;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.annotation.*;
-import org.springframework.web.multipart.MultipartFile;
-import org.springframework.web.servlet.support.ServletUriComponentsBuilder;
+import com.esig.feed.service.CloudinaryService;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.domain.Sort;
 import org.springframework.data.web.PageableDefault;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.web.multipart.MultipartFile;
+
 import java.io.IOException;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.Paths;
-import java.util.UUID;
+import java.time.LocalDateTime;
+import java.util.Optional;
 
 @RestController
 @RequestMapping("/api/posts")
 public class PostController {
 
-    @Autowired
-    private PostRepository postRepository;
+    private final PostRepository postRepository;
+    private final CloudinaryService cloudinaryService;
 
-    // Pasta onde as imagens enviadas pelo celular serão salvas
-    private final String UPLOAD_DIR = "uploads/";
+    public PostController(PostRepository postRepository, CloudinaryService cloudinaryService) {
+        this.postRepository = postRepository;
+        this.cloudinaryService = cloudinaryService;
+    }
 
+    // 1. GET: Retorna os posts paginados (Mais recentes primeiro)
     @GetMapping
-    public ResponseEntity<Page<Post>> getAllPosts(
-            @PageableDefault(page = 0, size = 10, sort = "createdAt", direction = Sort.Direction.DESC) Pageable pageable) {
+    public ResponseEntity<Page<Post>> getPosts(
+            @PageableDefault(size = 10, sort = "createdAt", direction = Sort.Direction.DESC) Pageable pageable) {
 
-        // O findAll agora recebe o pageable e retorna uma Page em vez de uma List
         Page<Post> posts = postRepository.findAll(pageable);
         return ResponseEntity.ok(posts);
     }
 
-    @GetMapping("/{id}")
-    public ResponseEntity<Post> getPostById(@PathVariable Long id) {
-        return postRepository.findById(id)
-                .map(ResponseEntity::ok)
-                .orElse(ResponseEntity.notFound().build());
-    }
-
-    // Agora recebe multipart/form-data
-    @PostMapping(consumes = {"multipart/form-data"})
+    // 2. POST: Cria um novo post
+    @PostMapping
     public ResponseEntity<Post> createPost(
             @RequestParam("username") String username,
             @RequestParam("description") String description,
             @RequestParam(value = "file", required = false) MultipartFile file) {
 
-        Post post = new Post();
-        post.setUsername(username);
-        post.setDescription(description);
+        try {
+            String imageUrl = null;
+            if (file != null && !file.isEmpty()) {
+                imageUrl = cloudinaryService.uploadImage(file);
+            }
 
-        if (file != null && !file.isEmpty()) {
-            String fileName = saveImage(file);
-            // Gera a URL completa para o Flutter acessar depois: http://localhost:8080/uploads/nome-da-foto.jpg
-            String fileDownloadUri = ServletUriComponentsBuilder.fromCurrentContextPath()
-                    .path("/uploads/")
-                    .path(fileName)
-                    .toUriString();
-            post.setImageUrl(fileDownloadUri);
+            Post post = new Post();
+            post.setUsername(username);
+            post.setDescription(description);
+            post.setImageUrl(imageUrl);
+            post.setCreatedAt(LocalDateTime.now()); // Ajuste conforme a sua entidade
+
+            Post savedPost = postRepository.save(post);
+            return ResponseEntity.ok(savedPost);
+
+        } catch (IOException e) {
+            return ResponseEntity.internalServerError().build();
         }
-
-        Post savedPost = postRepository.save(post);
-        return ResponseEntity.ok(savedPost);
     }
 
-    @PutMapping(value = "/{id}", consumes = {"multipart/form-data"})
+    // 3. PUT: Atualiza a descrição e/ou a imagem
+    @PutMapping("/{id}")
     public ResponseEntity<Post> updatePost(
             @PathVariable Long id,
-            @RequestParam("username") String username,
+            @RequestParam("username") String username, // Opcional checar se o dono é o mesmo
             @RequestParam("description") String description,
             @RequestParam(value = "file", required = false) MultipartFile file) {
 
-        return postRepository.findById(id)
-                .map(post -> {
-                    post.setUsername(username);
-                    post.setDescription(description);
+        Optional<Post> postOptional = postRepository.findById(id);
 
-                    if (file != null && !file.isEmpty()) {
-                        String fileName = saveImage(file);
-                        String fileDownloadUri = ServletUriComponentsBuilder.fromCurrentContextPath()
-                                .path("/uploads/")
-                                .path(fileName)
-                                .toUriString();
-                        post.setImageUrl(fileDownloadUri);
-                    }
+        if (postOptional.isEmpty()) {
+            return ResponseEntity.notFound().build();
+        }
 
-                    Post updated = postRepository.save(post);
-                    return ResponseEntity.ok(updated);
-                })
-                .orElse(ResponseEntity.notFound().build());
+        Post post = postOptional.get();
+
+        try {
+            // Se o usuário mandou uma foto nova, temos que apagar a velha e subir a nova!
+            if (file != null && !file.isEmpty()) {
+                // Apaga a antiga do Cloudinary para não gerar lixo na nuvem
+                if (post.getImageUrl() != null) {
+                    cloudinaryService.deleteImageByUrl(post.getImageUrl());
+                }
+                // Sobe a nova e atualiza a URL
+                String newImageUrl = cloudinaryService.uploadImage(file);
+                post.setImageUrl(newImageUrl);
+            }
+
+            post.setDescription(description);
+            // Salva no banco
+            Post updatedPost = postRepository.save(post);
+
+            return ResponseEntity.ok(updatedPost);
+
+        } catch (IOException e) {
+            return ResponseEntity.internalServerError().build();
+        }
     }
 
+    // 4. DELETE: Apaga o post e a imagem da nuvem
     @DeleteMapping("/{id}")
     public ResponseEntity<Void> deletePost(@PathVariable Long id) {
-        if (postRepository.existsById(id)) {
-            postRepository.deleteById(id);
-            return ResponseEntity.noContent().build();
-        }
-        return ResponseEntity.notFound().build();
-    }
+        Optional<Post> postOptional = postRepository.findById(id);
 
-    // Método auxiliar para salvar o arquivo físico no computador/servidor
-    private String saveImage(MultipartFile file) {
-        try {
-            Path uploadPath = Paths.get(UPLOAD_DIR);
-            if (!Files.exists(uploadPath)) {
-                Files.createDirectories(uploadPath);
-            }
-            // Cria um nome único para não sobrescrever imagens com o mesmo nome
-            String fileName = UUID.randomUUID() + "_" + file.getOriginalFilename();
-            Path filePath = uploadPath.resolve(fileName);
-            Files.copy(file.getInputStream(), filePath);
-            return fileName;
-        } catch (IOException e) {
-            throw new RuntimeException("Erro ao salvar a imagem", e);
+        if (postOptional.isEmpty()) {
+            return ResponseEntity.notFound().build();
         }
+
+        Post post = postOptional.get();
+
+        // Limpa a imagem lá do Cloudinary primeiro
+        if (post.getImageUrl() != null) {
+            cloudinaryService.deleteImageByUrl(post.getImageUrl());
+        }
+
+        // Apaga do banco de dados (Neon)
+        postRepository.delete(post);
+
+        return ResponseEntity.noContent().build();
     }
 }
